@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 """Bouw de Cognac-crus kaartlaag voor Obsidian Bases (Maps-plugin).
 
-VERSIE 3.2 — wijzigingen:
-* v2: actuele grenzen via `geo.api.gouv.fr` (communes nouvelles).
-* v3.1: interne gaten (witte vlekken) op UNIE-niveau opvullen, incl. gaten op de
-  grens tussen twee crus.
-* v3.2: kustlijn-clipping STANDAARD UIT (zoals de eerste versie). De officiële
-  commune-grenzen blijven volledig behouden; coastline-clip met de grove
-  Natural Earth 10m-bron sneed kustgemeenten verkeerd af. Optioneel weer aan met
-  `--clip` (alleen zinvol met een fijne kustbron; zie LAND_GEOJSON_URL).
+VERSIE 3.7 — splitsing van split-gemeenten, in volgorde van VOORRANG:
+  1. AANGELEVERDE LIJN (cru-splitlines.geojson/.kml/.gpx) die de gemeente
+     doorsnijdt — bv. de Charente. Jouw getekende lijn wint dus.
+  2. OFFICIËLE DEELGEMEENTE-GEOMETRIE (communes déléguées via geo.api) — voor
+     fusiegemeenten mét déléguées (zie DELEGUEE_SPLITS), als er geen lijn ligt.
+  3. ANDERS: de hele gemeente naar de hoofd-cru (hoogste prioriteit). GEEN
+     rasterbenadering -> geen zaagtandranden.
 
-Produceert:
-  1. cognac-crus.geojson            -> 6 features (één per cru), property `cru`
-  2. cognac-crus-style-light.json   -> OpenFreeMap 'bright' + cru-fill
-  3. cognac-crus-style-dark.json    -> OpenFreeMap 'dark'   + cru-fill
+Eerder: actuele grenzen via geo.api (v2), interne gaten vullen (v3.1),
+kustlijn-clip standaard uit (v3.2).
 
-AFHANKELIJKHEDEN: Python 3.9+, `requests`, `shapely`.
-    pip install requests shapely
+Produceert: cognac-crus.geojson + cognac-crus-style-light/dark.json.
+AFHANKELIJKHEDEN: Python 3.9+, `requests`, `shapely`.   pip install requests shapely
 
 GEBRUIK:
-    python build_cognac_map.py                 # alles (gaten vullen, GEEN kust-clip)
-    python build_cognac_map.py --no-fill       # interne gaten NIET vullen
-    python build_cognac_map.py --clip          # WEL op de kustlijn knippen
+    python build_cognac_map.py                 # alles
+    python build_cognac_map.py --no-split      # split-gemeenten op hoofd-cru laten
     python build_cognac_map.py --verify        # check tegen producers_points.json
-    python build_cognac_map.py --skip-styles   # alleen de geojson
-    python build_cognac_map.py --inline-geojson  # geojson in de styles embedden
+    python build_cognac_map.py --no-fill / --clip / --skip-styles / --inline-geojson
 """
 
 from __future__ import annotations
@@ -33,13 +28,16 @@ import argparse
 import json
 import logging
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Iterable
 
 import requests
-from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
+from shapely.geometry import (
+    LineString, MultiLineString, MultiPolygon, Point, Polygon, box, mapping, shape,
+)
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
+from shapely.ops import polygonize, unary_union
 
 # --------------------------------------------------------------------------- #
 # Configuratie                                                                 #
@@ -50,6 +48,11 @@ HERE: Path = Path(__file__).resolve().parent
 MAPPING_PATH: Path = HERE / "cognac_cru_communes.json"
 PRODUCERS_PATH: Path = HERE / "producers_points.json"  # alleen voor --verify
 
+SPLITLINE_CANDIDATES: list[str] = [
+    "cru-splitlines.geojson", "cru-splitlines.json",
+    "cru-splitlines.kml", "cru-splitlines.gpx",
+]
+
 OUTPUT_GEOJSON: Path = HERE / "cognac-crus.geojson"
 OUTPUT_STYLE_LIGHT: Path = HERE / "cognac-crus-style-light.json"
 OUTPUT_STYLE_DARK: Path = HERE / "cognac-crus-style-dark.json"
@@ -57,7 +60,7 @@ OUTPUT_STYLE_DARK: Path = HERE / "cognac-crus-style-dark.json"
 GEOJSON_PUBLIC_URL: str = "https://raw.githubusercontent.com/maanrijp/cognac-map/main/cognac-crus.geojson"
 
 FILL_OPACITY: float = 0.45
-SIMPLIFY_TOLERANCE_DEG: float = 0.0006   # ~60 m
+SIMPLIFY_TOLERANCE_DEG: float = 0.0006
 COORD_PRECISION: int = 5
 HTTP_TIMEOUT: int = 120
 
@@ -67,9 +70,18 @@ GEO_API_COMMUNES: str = (
     "https://geo.api.gouv.fr/communes"
     "?codeDepartement={dep}&fields=code,nom&format=geojson&geometry=contour"
 )
+GEO_API_DELEGUEE: str = (
+    "https://geo.api.gouv.fr/communes_associees_deleguees/{code}"
+    "?fields=nom,code&format=geojson&geometry=contour"
+)
 
-# Alleen gebruikt met --clip. Natural Earth 10m is grof; vervang door een fijne
-# kustbron (bv. OSM water/land-polygons) als je netjes op de waterrand wilt knippen.
+# Datagedreven split via officiële deelgemeente-geometrie (gebruikt als er geen
+# lijn ligt):  commune nouvelle (INSEE) -> { déléguée-INSEE: cru }.
+DELEGUEE_SPLITS: dict[str, dict[str, str]] = {
+    "16224": {"16224": "Petite Champagne", "16179": "Fins Bois"},  # Montmérac: Montchaude / Lamérac
+    "16233": {"16233": "Petite Champagne", "16351": "Fins Bois"},  # Mosnac-Saint-Simeux: Mosnac / Saint-Simeux
+}
+
 LAND_GEOJSON_URL: str = (
     "https://raw.githubusercontent.com/martynafford/natural-earth-geojson/"
     "master/10m/physical/ne_10m_land.json"
@@ -90,24 +102,17 @@ CRU_COLORS: dict[str, str] = {
 }
 
 CRU_PRIORITY: list[str] = [
-    "Grande Champagne",
-    "Petite Champagne",
-    "Borderies",
-    "Fins Bois",
-    "Bons Bois",
-    "Bois Ordinaires",
+    "Grande Champagne", "Petite Champagne", "Borderies",
+    "Fins Bois", "Bons Bois", "Bois Ordinaires",
 ]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("cognac-map")
 
 
 # --------------------------------------------------------------------------- #
-# Inlezen & toewijzing                                                         #
+# Inlezen & lidmaatschap                                                       #
 # --------------------------------------------------------------------------- #
 
 def load_json(path: Path) -> Any:
@@ -119,25 +124,78 @@ def load_json(path: Path) -> Any:
         raise ValueError(f"Ongeldige JSON in {path}: {exc}") from exc
 
 
-def build_insee_to_cru(mapping: dict[str, Any]) -> dict[str, str]:
-    """INSEE -> cru (eenduidig via CRU_PRIORITY); split-gemeenten worden gelogd."""
+def membership_from_mapping(mapping: dict[str, Any]) -> dict[str, set[str]]:
     crus: dict[str, list[dict[str, Any]]] = mapping["crus"]
     onbekend = [c for c in crus if c not in CRU_PRIORITY]
     if onbekend:
         raise ValueError(f"Onbekende cru-namen (niet in CRU_PRIORITY): {onbekend}")
-    rang = {cru: i for i, cru in enumerate(CRU_PRIORITY)}
-    toewijzing: dict[str, str] = {}
-    multi: dict[str, set[str]] = {}
+    membership: dict[str, set[str]] = {}
     for cru, communes in crus.items():
         for item in communes:
-            insee = str(item["insee"]).strip()
-            multi.setdefault(insee, set()).add(cru)
-            if insee not in toewijzing or rang[cru] < rang[toewijzing[insee]]:
-                toewijzing[insee] = cru
-    gesplitst = {i: cs for i, cs in multi.items() if len(cs) > 1}
-    if gesplitst:
-        log.info("Gemeenten in meerdere crus (toegekend via prioriteit): %d", len(gesplitst))
-    return toewijzing
+            membership.setdefault(str(item["insee"]).strip(), set()).add(cru)
+    return membership
+
+
+# --------------------------------------------------------------------------- #
+# Splitlijnen (GeoJSON / KML / GPX)                                            #
+# --------------------------------------------------------------------------- #
+
+def _lines_from_geojson(data: dict[str, Any]) -> list[LineString]:
+    out: list[LineString] = []
+    feats = data.get("features", []) if data.get("type") == "FeatureCollection" else [data]
+    for f in feats:
+        geom = f.get("geometry", f)
+        t = geom.get("type")
+        if t == "LineString":
+            out.append(LineString(geom["coordinates"]))
+        elif t == "MultiLineString":
+            out.extend(LineString(c) for c in geom["coordinates"])
+    return out
+
+
+def _lines_from_kml(text: str) -> list[LineString]:
+    out: list[LineString] = []
+    for el in ET.fromstring(text).iter():
+        if el.tag.rsplit("}", 1)[-1] == "coordinates" and el.text:
+            pts = []
+            for token in el.text.split():
+                lon, lat, *_ = token.split(",")
+                pts.append((float(lon), float(lat)))
+            if len(pts) >= 2:
+                out.append(LineString(pts))
+    return out
+
+
+def _lines_from_gpx(text: str) -> list[LineString]:
+    out: list[LineString] = []
+    for seg in ET.fromstring(text).iter():
+        if seg.tag.rsplit("}", 1)[-1] in ("trkseg", "rte"):
+            pts = [(float(pt.get("lon")), float(pt.get("lat")))
+                   for pt in seg if pt.tag.rsplit("}", 1)[-1] in ("trkpt", "rtept")]
+            if len(pts) >= 2:
+                out.append(LineString(pts))
+    return out
+
+
+def load_split_lines() -> list[LineString]:
+    path = next((HERE / n for n in SPLITLINE_CANDIDATES if (HERE / n).is_file()), None)
+    if path is None:
+        log.info("Geen splitlijn-bestand gevonden.")
+        return []
+    suffix = path.suffix.lower()
+    try:
+        if suffix in (".geojson", ".json"):
+            lines = _lines_from_geojson(json.loads(path.read_text(encoding="utf-8")))
+        elif suffix == ".kml":
+            lines = _lines_from_kml(path.read_text(encoding="utf-8"))
+        elif suffix == ".gpx":
+            lines = _lines_from_gpx(path.read_text(encoding="utf-8"))
+        else:
+            lines = []
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Kon splitlijnen niet lezen uit {path.name}: {exc}") from exc
+    log.info("Splitlijnen geladen uit %s: %d lijn(en).", path.name, len(lines))
+    return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -155,8 +213,11 @@ def _get_json(url: str) -> Any:
         raise RuntimeError(f"Geen geldige JSON ({url}): {exc}") from exc
 
 
+def _clean(geom: BaseGeometry) -> BaseGeometry:
+    return geom if geom.is_valid else geom.buffer(0)
+
+
 def download_communes(departementen: list[str]) -> dict[str, dict[str, Any]]:
-    """Actuele commune-contouren via geo.api.gouv.fr, geïndexeerd op INSEE."""
     by_insee: dict[str, dict[str, Any]] = {}
     for dep in departementen:
         log.info("Download actuele communes departement %s (geo.api.gouv.fr) ...", dep)
@@ -173,18 +234,23 @@ def download_communes(departementen: list[str]) -> dict[str, dict[str, Any]]:
     return by_insee
 
 
-def _clean(geom: BaseGeometry) -> BaseGeometry:
-    return geom if geom.is_valid else geom.buffer(0)
+_DELEGUEE_CACHE: dict[str, BaseGeometry] = {}
+
+
+def fetch_deleguee_contour(code: str) -> BaseGeometry:
+    """Haal de contour van een commune déléguée op (met cache)."""
+    if code not in _DELEGUEE_CACHE:
+        feat = _get_json(GEO_API_DELEGUEE.format(code=code))
+        _DELEGUEE_CACHE[code] = _clean(shape(feat["geometry"]))
+    return _DELEGUEE_CACHE[code]
 
 
 def download_land_mask(bbox: tuple[float, float, float, float]) -> BaseGeometry | None:
-    """Land-/kustlijn-polygoon, beperkt tot de regio-bbox (of None bij falen)."""
     try:
         fc = _get_json(LAND_GEOJSON_URL)
     except RuntimeError as exc:
         log.warning("Kustlijn-bron niet bereikbaar, sla clipping over: %s", exc)
         return None
-    from shapely.geometry import box
     region = box(*bbox).buffer(0.2)
     delen = [
         _clean(shape(f["geometry"])).intersection(region)
@@ -199,39 +265,119 @@ def download_land_mask(bbox: tuple[float, float, float, float]) -> BaseGeometry 
 
 
 # --------------------------------------------------------------------------- #
-# Cru-polygonen bouwen                                                         #
+# Split-gemeenten verdelen                                                     #
 # --------------------------------------------------------------------------- #
 
+def _nearest_cru(piece: BaseGeometry, masses: dict[str, BaseGeometry]) -> str:
+    rang = {c: i for i, c in enumerate(CRU_PRIORITY)}
+    pt = piece.representative_point()
+    return min(masses, key=lambda c: (pt.distance(masses[c]), rang[c]))
+
+
+def _split_by_deleguees(parent_geom: BaseGeometry, spec: dict[str, str]) -> dict[str, list[BaseGeometry]]:
+    """Splits een fusiegemeente via officiële deelgemeente-geometrie (geo.api)."""
+    parts: dict[str, list[BaseGeometry]] = {}
+    gebruikt: list[BaseGeometry] = []
+    for dcode, cru in spec.items():
+        dg = fetch_deleguee_contour(dcode)
+        clipped = _clean(dg.intersection(parent_geom))
+        if not clipped.is_empty:
+            parts.setdefault(cru, []).append(clipped)
+            gebruikt.append(clipped)
+    rest = _clean(parent_geom.difference(unary_union(gebruikt))) if gebruikt else parent_geom
+    if not rest.is_empty and rest.area > 1e-8 and parts:
+        massas = {cru: _clean(unary_union(gs)) for cru, gs in parts.items()}
+        for stuk in (rest.geoms if rest.geom_type == "MultiPolygon" else [rest]):
+            parts[_nearest_cru(stuk, massas)].append(stuk)
+    return parts
+
+
+def _split_by_lines(geom: BaseGeometry, lines: list[LineString]) -> list[BaseGeometry] | None:
+    relevant = [ln for ln in lines if ln.intersects(geom)]
+    if not relevant:
+        return None
+    merged = unary_union([geom.boundary, *relevant])
+    faces = [f for f in polygonize(merged) if geom.contains(f.representative_point())]
+    if len(faces) <= 1:
+        return None
+    return [_clean(f) for f in faces]
+
+
 def build_cru_geometries(
-    insee_to_cru: dict[str, str],
+    membership: dict[str, set[str]],
     communes_by_insee: dict[str, dict[str, Any]],
+    split_lines: list[LineString],
+    split: bool = True,
 ) -> dict[str, BaseGeometry]:
-    """Dissolve per cru; rapporteer INSEE-codes zonder geometrie."""
-    per_cru: dict[str, list[BaseGeometry]] = {cru: [] for cru in CRU_PRIORITY}
+    """Bouw per cru de geometrie; split-gemeenten via lijn / déléguée / hoofd-cru."""
+    enkel: dict[str, list[BaseGeometry]] = {cru: [] for cru in CRU_PRIORITY}
+    split_communes: list[tuple[str, BaseGeometry, set[str]]] = []
     ontbrekend: list[str] = []
-    for insee, cru in insee_to_cru.items():
-        feat = communes_by_insee.get(insee)
+    rang = {c: i for i, c in enumerate(CRU_PRIORITY)}
+
+    for code, crus in membership.items():
+        feat = communes_by_insee.get(code)
         if feat is None:
-            ontbrekend.append(insee)
+            ontbrekend.append(code)
             continue
-        per_cru[cru].append(_clean(shape(feat["geometry"])))
+        geom = _clean(shape(feat["geometry"]))
+        if len(crus) == 1 or not split:
+            enkel[min(crus, key=lambda c: rang[c])].append(geom)
+        else:
+            split_communes.append((code, geom, crus))
+
     if ontbrekend:
-        log.warning(
-            "Geen geometrie voor %d INSEE-code(s) (verouderd/opgeheven): %s",
-            len(ontbrekend), ", ".join(sorted(ontbrekend)),
-        )
+        log.warning("Geen geometrie voor %d INSEE-code(s) (verouderd/opgeheven): %s",
+                    len(ontbrekend), ", ".join(sorted(ontbrekend)))
+
+    massa = {cru: (_clean(unary_union(g)) if g else Polygon()) for cru, g in enkel.items()}
+    massa_snel = {c: m.simplify(0.003) for c, m in massa.items()}
+    extra: dict[str, list[BaseGeometry]] = {cru: [] for cru in CRU_PRIORITY}
+
+    # Per split-gemeente, in volgorde van VOORRANG:
+    #   1) aangeleverde lijn (rivier) die de gemeente doorsnijdt;
+    #   2) officiële deelgemeente-geometrie (déléguées);
+    #   3) anders de hele gemeente naar de hoofd-cru (geen zaagtandranden).
+    via_lijn = via_deleguee = via_heel = 0
+    for code, geom, crus in split_communes:
+        relevante = {c: massa_snel[c] for c in crus}
+        faces = _split_by_lines(geom, split_lines) if split_lines else None
+        if faces:
+            via_lijn += 1
+            for f in faces:
+                extra[_nearest_cru(f, relevante)].append(f)
+        elif code in DELEGUEE_SPLITS:
+            try:
+                for cru, gs in _split_by_deleguees(geom, DELEGUEE_SPLITS[code]).items():
+                    extra[cru].extend(gs)
+                via_deleguee += 1
+            except RuntimeError as exc:
+                doel = sorted(set(DELEGUEE_SPLITS[code].values()), key=lambda c: rang[c])[0]
+                log.warning("Déléguée-split mislukt voor %s (%s); hele gemeente -> %s.", code, exc, doel)
+                extra[doel].append(geom)
+                via_heel += 1
+        else:
+            extra[min(crus, key=lambda c: rang[c])].append(geom)
+            via_heel += 1
+
+    if split_communes:
+        log.info("Split-gemeenten: %d via aangeleverde lijn, %d via déléguée-data, "
+                 "%d heel naar hoofd-cru.", via_lijn, via_deleguee, via_heel)
+
     cru_geoms: dict[str, BaseGeometry] = {}
-    for cru, geoms in per_cru.items():
-        if not geoms:
-            log.warning("Cru '%s' zonder geometrie!", cru)
-            continue
-        cru_geoms[cru] = _clean(unary_union(geoms))
-        log.info("Cru '%s': %d communes samengevoegd.", cru, len(geoms))
+    for cru in CRU_PRIORITY:
+        stukken = enkel[cru] + extra[cru]
+        if stukken:
+            cru_geoms[cru] = _clean(unary_union(stukken))
+            log.info("Cru '%s' opgebouwd.", cru)
     return cru_geoms
 
 
+# --------------------------------------------------------------------------- #
+# Nabewerking                                                                  #
+# --------------------------------------------------------------------------- #
+
 def _drop_interior_rings(geom: BaseGeometry) -> BaseGeometry:
-    """Geef de geometrie terug zonder interne gaten (alleen buitenranden)."""
     if geom.geom_type == "Polygon":
         return Polygon(geom.exterior)
     if geom.geom_type == "MultiPolygon":
@@ -239,59 +385,38 @@ def _drop_interior_rings(geom: BaseGeometry) -> BaseGeometry:
     return geom
 
 
-def fill_internal_gaps(
-    cru_geoms: dict[str, BaseGeometry],
-    adjacency_eps: float = 0.0006,
-) -> dict[str, BaseGeometry]:
-    """Vul ALLE interne gaten (witte vlekken) van het totale cru-gebied op.
-
-    Op UNIE-niveau, zodat ook gaten op de GRENS tussen twee crus worden gevuld
-    (die zijn voor één cru geen intern gat):
-      1. Bepaal de unie van alle cru-vlakken en haal er de interne gaten uit.
-      2. Het verschil = de losse gat-polygonen (ontbrekende gemeenten e.d.).
-      3. Ken elk gat toe aan de cru die er het meest omheen ligt (grootste
-         overlap van een licht opgeblazen gat met die cru) en voeg het toe.
-    Geen witte enclaves, geen overlap (elk gat gaat naar precies één cru).
-    """
+def fill_internal_gaps(cru_geoms: dict[str, BaseGeometry],
+                       adjacency_eps: float = 0.0006) -> dict[str, BaseGeometry]:
     crus = dict(cru_geoms)
     union_all = _clean(unary_union(list(crus.values())))
-    filled = _drop_interior_rings(union_all)
-    gaps = _clean(filled.difference(union_all))
+    gaps = _clean(_drop_interior_rings(union_all).difference(union_all))
     if gaps.is_empty:
         log.info("Geen interne gaten gevonden.")
         return crus
-
     gap_polys = list(gaps.geoms) if gaps.geom_type == "MultiPolygon" else [gaps]
     out = dict(crus)
-    bijgevuld = 0.0
     n = 0
     for gap in gap_polys:
         if gap.area <= 0:
             continue
-        opgeblazen = gap.buffer(adjacency_eps)
-        scores = {c: opgeblazen.intersection(g).area for c, g in crus.items()}
+        scores = {c: gap.buffer(adjacency_eps).intersection(g).area for c, g in crus.items()}
         beste = max(scores, key=scores.get)
         if scores[beste] <= 0:
-            continue  # grenst aan geen enkele cru -> laat staan
+            continue
         out[beste] = _clean(unary_union([out[beste], gap]))
-        bijgevuld += gap.area
         n += 1
     if n:
-        log.info("Interne gaten opgevuld: %d stuk(s) (≈%.4f deg²).", n, bijgevuld)
+        log.info("Interne gaten opgevuld: %d stuk(s).", n)
     return out
 
 
 def clip_to_coast(cru_geoms: dict[str, BaseGeometry], land: BaseGeometry) -> dict[str, BaseGeometry]:
-    """Knip de cru-vlakken op de kustlijn (alleen met --clip)."""
     return {cru: _clean(geom.intersection(land)) for cru, geom in cru_geoms.items()}
 
 
 def simplify_all(cru_geoms: dict[str, BaseGeometry]) -> dict[str, BaseGeometry]:
-    """Vereenvoudig elk cru-vlak licht (kleinere bestanden)."""
-    return {
-        cru: _clean(geom.simplify(SIMPLIFY_TOLERANCE_DEG, preserve_topology=True))
-        for cru, geom in cru_geoms.items()
-    }
+    return {cru: _clean(geom.simplify(SIMPLIFY_TOLERANCE_DEG, preserve_topology=True))
+            for cru, geom in cru_geoms.items()}
 
 
 def _round_coords(obj: Any, ndigits: int) -> Any:
@@ -338,11 +463,8 @@ def _fill_color_expression() -> list[Any]:
     return expr
 
 
-def inject_cru_layer(
-    style: dict[str, Any],
-    geojson_url: str | None,
-    geojson_inline: dict[str, Any] | None,
-) -> dict[str, Any]:
+def inject_cru_layer(style: dict[str, Any], geojson_url: str | None,
+                     geojson_inline: dict[str, Any] | None) -> dict[str, Any]:
     if (geojson_url is None) == (geojson_inline is None):
         raise ValueError("Geef precies één van geojson_url / geojson_inline op.")
     style = json.loads(json.dumps(style))
@@ -351,9 +473,7 @@ def inject_cru_layer(
         "data": geojson_inline if geojson_inline is not None else geojson_url,
     }
     fill_layer = {
-        "id": "cognac-cru-vlakken",
-        "type": "fill",
-        "source": "cognac-crus",
+        "id": "cognac-cru-vlakken", "type": "fill", "source": "cognac-crus",
         "paint": {
             "fill-color": _fill_color_expression(),
             "fill-opacity": FILL_OPACITY,
@@ -370,11 +490,9 @@ def inject_cru_layer(
 def build_styles(geojson_inline: dict[str, Any] | None) -> None:
     for variant, out_path in (("light", OUTPUT_STYLE_LIGHT), ("dark", OUTPUT_STYLE_DARK)):
         base = _get_json(OFM_STYLE_URLS[variant])
-        merged = inject_cru_layer(
-            base,
-            geojson_url=None if geojson_inline else GEOJSON_PUBLIC_URL,
-            geojson_inline=geojson_inline,
-        )
+        merged = inject_cru_layer(base,
+                                  geojson_url=None if geojson_inline else GEOJSON_PUBLIC_URL,
+                                  geojson_inline=geojson_inline)
         write_json(out_path, merged)
 
 
@@ -383,7 +501,6 @@ def build_styles(geojson_inline: dict[str, Any] | None) -> None:
 # --------------------------------------------------------------------------- #
 
 def verify_against_producers(cru_geoms: dict[str, BaseGeometry]) -> None:
-    """Controleer dat elke producent binnen het vlak van zijn eigen cru valt."""
     data = load_json(PRODUCERS_PATH)
     producers = data.get("producers", [])
     tol = 0.003
@@ -398,21 +515,17 @@ def verify_against_producers(cru_geoms: dict[str, BaseGeometry]) -> None:
             juist += 1
             continue
         elders = [cru for cru, g in buffered.items() if g.contains(pt)]
-        if elders:
-            anders.append(f"{p['naam']} ({p['gemeente']}): notitie={p['cru']} -> ligt in {elders}")
-        else:
-            buiten.append(f"{p['naam']} ({p['gemeente']}, {p['cru']})")
+        (anders if elders else buiten).append(
+            f"{p['naam']} ({p['gemeente']}): notitie={p['cru']}"
+            + (f" -> ligt in {elders}" if elders else " -> ligt buiten elk vlak"))
     log.info("VERIFICATIE: %d/%d producenten in eigen cru-vlak.", juist, len(producers))
-    if anders:
-        log.warning("In een ANDER cru-vlak (%d):", len(anders))
-        for r in anders:
-            log.warning("  %s", r)
-    if buiten:
-        log.warning("BUITEN elk vlak — mogelijk gat (%d):", len(buiten))
-        for r in buiten:
-            log.warning("  %s", r)
+    for kop, lijst in (("In een ANDER cru-vlak", anders), ("BUITEN elk vlak", buiten)):
+        if lijst:
+            log.warning("%s (%d):", kop, len(lijst))
+            for r in lijst:
+                log.warning("  %s", r)
     if not anders and not buiten:
-        log.info("Geen gaten gevonden bij de producent-locaties. 🎉")
+        log.info("Geen afwijkingen bij de producent-locaties. 🎉")
 
 
 # --------------------------------------------------------------------------- #
@@ -420,38 +533,35 @@ def verify_against_producers(cru_geoms: dict[str, BaseGeometry]) -> None:
 # --------------------------------------------------------------------------- #
 
 def main(argv: Iterable[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Bouw de Cognac-crus kaartlaag (v3.2).")
+    parser = argparse.ArgumentParser(description="Bouw de Cognac-crus kaartlaag (v3.7).")
     parser.add_argument("--skip-styles", action="store_true")
-    parser.add_argument("--clip", action="store_true",
-                        help="WEL op de kustlijn knippen (alleen zinvol met een fijne kustbron)")
+    parser.add_argument("--clip", action="store_true", help="WEL op de kustlijn knippen")
     parser.add_argument("--no-fill", action="store_true", help="interne gaten NIET opvullen")
+    parser.add_argument("--no-split", action="store_true", help="split-gemeenten NIET splitsen")
     parser.add_argument("--inline-geojson", action="store_true")
-    parser.add_argument("--verify", action="store_true", help="check tegen producers_points.json")
+    parser.add_argument("--verify", action="store_true")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
         mapping_data = load_json(MAPPING_PATH)
-        insee_to_cru = build_insee_to_cru(mapping_data)
+        membership = membership_from_mapping(mapping_data)
+        split_lines = [] if args.no_split else load_split_lines()
         communes = download_communes(DEPARTEMENTEN)
-        cru_geoms = build_cru_geometries(insee_to_cru, communes)
+        cru_geoms = build_cru_geometries(membership, communes, split_lines, split=not args.no_split)
 
         if not args.no_fill:
             cru_geoms = fill_internal_gaps(cru_geoms)
-
-        # Kustlijn-clipping is standaard UIT (volledige commune-grenzen behouden).
         if args.clip:
             land = download_land_mask(unary_union(list(cru_geoms.values())).bounds)
             if land is not None:
                 cru_geoms = clip_to_coast(cru_geoms, land)
 
         cru_geoms = simplify_all(cru_geoms)
-
         fc = to_feature_collection(cru_geoms)
         write_json(OUTPUT_GEOJSON, fc)
 
         if args.verify:
             verify_against_producers(cru_geoms)
-
         if not args.skip_styles:
             build_styles(geojson_inline=fc if args.inline_geojson else None)
 
