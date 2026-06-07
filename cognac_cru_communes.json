@@ -555,7 +555,9 @@
    },
    {
     "nom": "Gardes-le-Pontaroux",
-    "insee": "16147"
+    "insee": "16147",
+    "status": "onmatched_oude_naam",
+    "verklaring": "Opgegaan in commune nouvelle 'Boisné-La Tude' (16082); Gardes-le-Pontaroux bestaat niet meer als zelfstandige commune."
    },
    {
     "nom": "Genac-Bignac",
@@ -619,7 +621,9 @@
    },
    {
     "nom": "Magnac-Lavalette-Villars",
-    "insee": "16198"
+    "insee": "16198",
+    "status": "onmatched_oude_naam",
+    "verklaring": "Oude naam; sinds commune nouvelle heet deze 'Magnac-lès-Gardes' (16198), die al apart in de cru staat."
    },
    {
     "nom": "Magnac-lès-Gardes",
@@ -664,7 +668,9 @@
    },
    {
     "nom": "Montignac-Charente",
-    "insee": "16226"
+    "insee": "16226",
+    "status": "onmatched_oude_naam",
+    "verklaring": "Opgegaan in commune nouvelle 'Mansle-les-Fontaines' (16206); 16226 staat niet meer in de actuele lijst (Montignac-Charente is nu commune déléguée). Mansle-les-Fontaines staat al apart in de cru."
    },
    {
     "nom": "Mornac",
@@ -840,7 +846,9 @@
    },
    {
     "nom": "Vars",
-    "insee": "16393"
+    "insee": "16393",
+    "status": "onmatched_oude_naam",
+    "verklaring": "Opgegaan in commune nouvelle 'La Boixe' (16393); 'Vars' is niet meer zelfstandig. La Boixe (16393) staat al apart in de cru."
    },
    {
     "nom": "Vaux-Lavalette",
@@ -1602,7 +1610,9 @@
    },
    {
     "nom": "Moutonneau",
-    "insee": "16238"
+    "insee": "16238",
+    "status": "onmatched_oude_naam",
+    "verklaring": "Opgegaan in commune nouvelle 'Mansle-les-Fontaines' (16206); Moutonneau (16238) bestaat niet meer zelfstandig."
    },
    {
     "nom": "Nabinaud",
@@ -2150,7 +2160,9 @@
    },
    {
     "nom": "Nuaillé-sur-Boutonne",
-    "insee": "17268"
+    "insee": "17268",
+    "status": "onmatched_oude_naam",
+    "verklaring": "Oude naam; gefuseerd tot 'Rives-de-Boutonne' (17268), die al apart in de cru staat."
    },
    {
     "nom": "Orignolles",
@@ -2243,7 +2255,9 @@
    },
    {
     "nom": "Saint-Georges-de-Longuepierre",
-    "insee": "17334"
+    "insee": "17334",
+    "status": "onmatched_oude_naam",
+    "verklaring": "Opgegaan in commune nouvelle 'Rives-de-Boutonne' (17268); naam niet meer in de actuele lijst."
    },
    {
     "nom": "Saint-Georges-des-Coteaux",
@@ -3161,7 +3175,6 @@
   "16144",
   "16145",
   "16146",
-  "16147",
   "16148",
   "16150",
   "16151",
@@ -3215,7 +3228,6 @@
   "16221",
   "16222",
   "16224",
-  "16226",
   "16227",
   "16230",
   "16232",
@@ -3223,7 +3235,6 @@
   "16234",
   "16236",
   "16237",
-  "16238",
   "16240",
   "16241",
   "16243",
@@ -3648,7 +3659,6 @@
   "17331",
   "17332",
   "17333",
-  "17334",
   "17335",
   "17336",
   "17337",
@@ -3805,11 +3815,54 @@
   "79334",
   "79346"
  ],
- "onmatched_namen": [],
- "opmerking_dubbele_insee_binnen_cru": [
-  "Fins Bois: Magnac-Lavalette-Villars & Magnac-lès-Gardes -> 16198",
-  "Fins Bois: La Boixe & Vars -> 16393",
-  "Bons Bois: La Rochefoucauld-en-Angoumois & La Rochefoucauld-en-Angoumois -> 16281",
-  "Bons Bois: Nuaillé-sur-Boutonne & Rives-de-Boutonne -> 17268"
- ]
+ "onmatched_namen": [
+  {
+   "cru": "Fins Bois",
+   "nom": "Gardes-le-Pontaroux",
+   "insee_oud": "16147",
+   "verklaring": "Opgegaan in commune nouvelle 'Boisné-La Tude' (16082); Gardes-le-Pontaroux bestaat niet meer als zelfstandige commune."
+  },
+  {
+   "cru": "Fins Bois",
+   "nom": "Magnac-Lavalette-Villars",
+   "insee_oud": "16198",
+   "verklaring": "Oude naam; sinds commune nouvelle heet deze 'Magnac-lès-Gardes' (16198), die al apart in de cru staat."
+  },
+  {
+   "cru": "Fins Bois",
+   "nom": "Montignac-Charente",
+   "insee_oud": "16226",
+   "verklaring": "Opgegaan in commune nouvelle 'Mansle-les-Fontaines' (16206); 16226 staat niet meer in de actuele lijst (Montignac-Charente is nu commune déléguée). Mansle-les-Fontaines staat al apart in de cru."
+  },
+  {
+   "cru": "Fins Bois",
+   "nom": "Vars",
+   "insee_oud": "16393",
+   "verklaring": "Opgegaan in commune nouvelle 'La Boixe' (16393); 'Vars' is niet meer zelfstandig. La Boixe (16393) staat al apart in de cru."
+  },
+  {
+   "cru": "Bons Bois",
+   "nom": "Moutonneau",
+   "insee_oud": "16238",
+   "verklaring": "Opgegaan in commune nouvelle 'Mansle-les-Fontaines' (16206); Moutonneau (16238) bestaat niet meer zelfstandig."
+  },
+  {
+   "cru": "Bons Bois",
+   "nom": "Nuaillé-sur-Boutonne",
+   "insee_oud": "17268",
+   "verklaring": "Oude naam; gefuseerd tot 'Rives-de-Boutonne' (17268), die al apart in de cru staat."
+  },
+  {
+   "cru": "Bons Bois",
+   "nom": "Saint-Georges-de-Longuepierre",
+   "insee_oud": "17334",
+   "verklaring": "Opgegaan in commune nouvelle 'Rives-de-Boutonne' (17268); naam niet meer in de actuele lijst."
+  }
+ ],
+ "herijking": {
+  "uitgevoerd_op": "2026-06-06",
+  "methode": "Herijkt tegen geo.api.gouv.fr communes (dep 16/17/24/79, code officiel actueel).",
+  "aantal_gewijzigd": 0,
+  "aantal_onmatched": 7
+ }
 }
